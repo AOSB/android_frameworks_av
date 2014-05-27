@@ -37,6 +37,8 @@
 #include <utils/String8.h>
 #include <media/stagefright/foundation/ABitReader.h>
 
+#include <cutils/properties.h>
+
 namespace android {
 
 struct DataSourceReader : public mkvparser::IMkvReader {
@@ -467,8 +469,9 @@ status_t MatroskaSource::readBlock() {
     const mkvparser::Block *block = mBlockIter.block();
 
     int64_t timeUs = mBlockIter.blockTimeUs();
+    int frameCount = block->GetFrameCount();
 
-    for (int i = 0; i < block->GetFrameCount(); ++i) {
+    for (int i = 0; i < frameCount; ++i) {
         const mkvparser::Block::Frame &frame = block->GetFrame(i);
 
         MediaBuffer *mbuf = new MediaBuffer(frame.len);
@@ -487,6 +490,27 @@ status_t MatroskaSource::readBlock() {
     }
 
     mBlockIter.advance();
+
+    if (!mBlockIter.eos() && frameCount > 1) {
+        // For files with lacing enabled, we need to amend they kKeyTime of
+        // each frame so that their kKeyTime are advanced accordingly (instead
+        // of being set to the same value). To do this, we need to find out
+        // the duration of the block using the start time of the next block.
+        int64_t duration = mBlockIter.blockTimeUs() - timeUs;
+        int64_t durationPerFrame = duration / frameCount;
+        int64_t durationRemainder = duration % frameCount;
+
+        // We split duration to each of the frame, distributing the remainder (if any)
+        // to the later frames. The later frames are processed first due to the
+        // use of the iterator for the doubly linked list
+        List<MediaBuffer *>::iterator it = mPendingFrames.end();
+        for (int i = frameCount - 1; i >= 0; --i) {
+            --it;
+            int64_t frameRemainder = durationRemainder >= frameCount - i ? 1 : 0;
+            int64_t frameTimeUs = timeUs + durationPerFrame * i + frameRemainder;
+            (*it)->meta_data()->setInt64(kKeyTime, frameTimeUs);
+        }
+    }
 
     return OK;
 }
@@ -660,6 +684,27 @@ MatroskaExtractor::MatroskaExtractor(const sp<DataSource> &source)
 
     ret = mSegment->ParseHeaders();
     CHECK_EQ(ret, 0);
+
+    const mkvparser::SegmentInfo *info = mSegment->GetInfo();
+
+    const char* muxingAppInfo = info->GetMuxingAppAsUTF8();
+    const char* writingApp    = info->GetWritingAppAsUTF8();
+
+    char property_value[PROPERTY_VALUE_MAX] = {0};
+    int parser_flags = 0;
+    property_get("mm.enable.qcom_parser", property_value, "0");
+    parser_flags = atoi(property_value);
+
+    //if divx parsing is disabled and clip has divx hint, bailout
+    //flag 0x00100000 is for DivX and 0x00200000 is for DivxHD
+    if(!(0x00300000 & parser_flags) &&
+       ((!strncasecmp(muxingAppInfo, "libDivX", 7)) ||
+       (!strncasecmp(writingApp, "DivX", 4)))) {
+        ALOGW("format found is not supported -- Bailing out --");
+        delete mSegment;
+        mSegment = NULL;
+        return;
+    }
 
     long len;
     ret = mSegment->LoadCluster(pos, len);
